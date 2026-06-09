@@ -40,7 +40,7 @@ deepseek_client = AsyncOpenAI(
 # ========== ХРАНИЛИЩЕ ПОЛЬЗОВАТЕЛЕЙ ==========
 user_sessions: Dict[int, Dict] = {}
 MAX_HISTORY_LENGTH = 20
-DEFAULT_SYSTEM_PROMPT = "Ты полезный, добрый и краткий помощник. Отвечай на русском языке."
+DEFAULT_SYSTEM_PROMPT = "Ты полезный, добрый, слегка загадочный и краткий помощник. Отвечай на русском языке."
 
 def get_session(user_id: int) -> Dict:
     if user_id not in user_sessions:
@@ -92,7 +92,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     get_session(user_id)
     await update.message.reply_text(
-        "🤖 Привет! Я бот, работающий на основе DeepSeek и OpenAI.\n\n"
+        "🤖 Привет! Я бот MimAI, работающий на основе DeepSeek и OpenAI.\n\n"
         "Команды:\n"
         "/reset – сбросить историю\n"
         "/system <промпт> – сменить личность\n"
