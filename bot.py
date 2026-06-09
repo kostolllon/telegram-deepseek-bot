@@ -1,288 +1,243 @@
-import logging
 import os
-import requests
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-import json
-from functools import wraps
-import datetime
+import asyncio
+import logging
+from typing import Dict, List
 
-# Токены и ключи
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7641501349:AAF7MdDDZUJlMm728k_KV1opANAYmA3LTjg")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-1ed0ae30c05f43fba1d65e46897400b8")
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
-
-USERS_FILE = "users.json"
-ADMIN_ID = 1129806592
-
-def migrate_users_data():
-    """Мигрирует старые данные пользователей в новый формат"""
-    try:
-        with open(USERS_FILE, "r") as f:
-            users = json.load(f)
-    except Exception:
-        return
-    
-    updated = False
-    for chat_id, user in users.items():
-        if isinstance(user, dict):
-            # Если это словарь (новый формат)
-            if "conversation_history" not in user:
-                user["conversation_history"] = []
-                updated = True
-        else:
-            # Если это число (старый формат) - конвертируем в новый
-            users[chat_id] = {
-                "first_seen": datetime.datetime.now().isoformat(),
-                "messages_count": 1,
-                "hours_activity": {},
-                "conversation_history": []
-            }
-            updated = True
-    
-    if updated:
-        with open(USERS_FILE, "w") as f:
-            json.dump(users, f)
-        logging.info("Users data migrated successfully")
-
-# Запускаем миграцию при старте
-migrate_users_data()
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+import aiohttp
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
 )
 
-def save_user(chat_id):
-    try:
-        with open(USERS_FILE, "r") as f:
-            users = json.load(f)
-    except Exception:
-        users = {}
-    user = users.get(str(chat_id), {})
-    now = datetime.datetime.now()
-    hour = str(now.hour)
-    if not user:
-        user["first_seen"] = now.isoformat()
-        user["messages_count"] = 1
-        user["hours_activity"] = {hour: 1}
-        user["conversation_history"] = []  # История диалога
-    else:
-        user["messages_count"] = user.get("messages_count", 0) + 1
-        hours = user.get("hours_activity", {})
-        hours[hour] = hours.get(hour, 0) + 1
-        user["hours_activity"] = hours
-    users[str(chat_id)] = user
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f)
+# ========== НАСТРОЙКИ ==========
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
-def add_to_conversation(chat_id, role, content):
-    """Добавляет сообщение в историю диалога пользователя"""
-    try:
-        with open(USERS_FILE, "r") as f:
-            users = json.load(f)
-    except Exception:
-        users = {}
-    
-    user = users.get(str(chat_id), {})
-    if "conversation_history" not in user:
-        user["conversation_history"] = []
-    
-    # Добавляем новое сообщение
-    user["conversation_history"].append({"role": role, "content": content})
-    
-    # Ограничиваем историю последними 25 сообщениями
-    if len(user["conversation_history"]) > 25:
-        user["conversation_history"] = user["conversation_history"][-25:]
-    
-    users[str(chat_id)] = user
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f)
+# Логирование
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-def get_conversation_history(chat_id):
-    """Получает историю диалога пользователя"""
-    try:
-        with open(USERS_FILE, "r") as f:
-            users = json.load(f)
-    except Exception:
-        return []
-    
-    user = users.get(str(chat_id), {})
-    return user.get("conversation_history", [])
+# Клиент DeepSeek (совместим с OpenAI API)
+deepseek_client = AsyncOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url=DEEPSEEK_BASE_URL,
+)
 
-def get_users():
-    try:
-        with open(USERS_FILE, "r") as f:
-            users = json.load(f)
-            return set(users.keys())
-    except Exception:
-        return set()
+# ========== ХРАНИЛИЩЕ ПОЛЬЗОВАТЕЛЕЙ ==========
+user_sessions: Dict[int, Dict] = {}
 
-def get_user_info(chat_id):
-    try:
-        with open(USERS_FILE, "r") as f:
-            users = json.load(f)
-            return users.get(str(chat_id), {})
-    except Exception:
-        return {}
+MAX_HISTORY_LENGTH = 10
+DEFAULT_SYSTEM_PROMPT = "Ты полезный, добрый и краткий помощник. Отвечай на русском языке."
 
-def collect_activity_by_hour():
-    try:
-        with open(USERS_FILE, "r") as f:
-            users = json.load(f)
-    except Exception:
-        return {}
-    total_by_hour = {str(h): 0 for h in range(24)}
-    for user in users.values():
-        hours = user.get("hours_activity", {})
-        for h, count in hours.items():
-            total_by_hour[h] = total_by_hour.get(h, 0) + count
-    return total_by_hour
+def get_session(user_id: int) -> Dict:
+    """Возвращает сессию пользователя (создаёт, если нет)"""
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {
+            "history": [],
+            "system_prompt": DEFAULT_SYSTEM_PROMPT,
+        }
+    return user_sessions[user_id]
 
-def admin_only(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user_id = update.effective_user.id
-        if user_id != ADMIN_ID:
-            await update.message.reply_text("Нет доступа. Только для администратора.")
-            return
-        return await func(update, context, *args, **kwargs)
-    return wrapper
+def trim_history(history: List[Dict]) -> List[Dict]:
+    """Ограничивает историю последними MAX_HISTORY_LENGTH сообщениями"""
+    if len(history) > MAX_HISTORY_LENGTH:
+        return history[-MAX_HISTORY_LENGTH:]
+    return history
 
+def split_long_message(text: str, max_len: int = 4096) -> List[str]:
+    """Разбивает длинный текст на части, не разрывая слова"""
+    if len(text) <= max_len:
+        return [text]
+    parts = []
+    while len(text) > max_len:
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at == -1:
+            split_at = text.rfind(" ", 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        parts.append(text[:split_at])
+        text = text[split_at:].lstrip()
+    parts.append(text)
+    return parts
+
+async def ask_deepseek_with_retry(
+    messages: List[Dict], retries: int = 2, delay: float = 1.0
+) -> str:
+    """Запрос к DeepSeek с повторными попытками"""
+    for attempt in range(retries + 1):
+        try:
+            response = await deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=2000,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"DeepSeek API error (attempt {attempt+1}): {e}")
+            if attempt < retries:
+                await asyncio.sleep(delay * (attempt + 1))
+            else:
+                raise Exception("Сервис DeepSeek временно недоступен. Попробуйте позже.")
+
+# ========== КОМАНДЫ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id == ADMIN_ID:
-        keyboard = [
-            [KeyboardButton("Статистика"), KeyboardButton("Рассылка")],
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        text = "Привет, админ! Выберите действие:"
-    else:
-        keyboard = [
-            [KeyboardButton("Помощь")],
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        text = "Привет! Я Telegram-бот с DeepSeek. Напиши мне что-нибудь или выбери действие."
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=reply_markup)
+    get_session(user_id)
+    await update.message.reply_text(
+        "🤖 Привет! Я бот на основе DeepSeek. Я помню контекст разговора.\n\n"
+        "Команды:\n"
+        "/reset – сбросить историю диалога\n"
+        "/system <новый промпт> – изменить мою личность\n"
+        "/image <описание> – сгенерировать картинку\n"
+        "/help – справка"
+    )
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = get_users()
-    await update.message.reply_text(f"Пользователей в базе: {len(users)}")
-
-@admin_only
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Использование: /broadcast текст_сообщения")
-        return
-    text = " ".join(context.args)
-    users = get_users()
-    count = 0
-    for chat_id in users:
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-            count += 1
-        except Exception:
-            pass
-    await update.message.reply_text(f"Рассылка завершена. Сообщение отправлено {count} пользователям.")
-
-@admin_only
-async def activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats = collect_activity_by_hour()
-    lines = [f"{h.zfill(2)}:00 — {stats[h]} сообщений" for h in sorted(stats, key=lambda x: int(x))]
-    text = "Активность по времени суток (по всем пользователям):\n" + "\n".join(lines)
-    await update.message.reply_text(text)
-
-def check_internet_connection():
-    try:
-        requests.get("https://api.telegram.org", timeout=5)
-        return True
-    except:
-        return False
-
-def ask_deepseek(prompt: str, chat_id: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    # Получаем историю диалога
-    conversation_history = get_conversation_history(chat_id)
-    
-    # Формируем сообщения для API
-    messages = []
-    
-    # Добавляем системное сообщение
-    messages.append({
-        "role": "system", 
-        "content": "Ты полезный ассистент. Отвечай на русском языке. Используй контекст предыдущих сообщений для более точных ответов."
-    })
-    
-    # Добавляем историю диалога
-    for msg in conversation_history:
-        messages.append({"role": msg["role"], "content": msg["content"]})
-    
-    # Добавляем текущий вопрос пользователя
-    messages.append({"role": "user", "content": prompt})
-    
-    data = {
-        "model": "deepseek-chat",
-        "messages": messages,
-        "max_tokens": 1000,
-        "temperature": 0.7
-    }
-    
-    try:
-        r = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=60)
-        r.raise_for_status()
-        result = r.json()
-        response = result["choices"][0]["message"]["content"]
-        
-        # Сохраняем диалог
-        add_to_conversation(chat_id, "user", prompt)
-        add_to_conversation(chat_id, "assistant", response)
-        
-        return response
-    except requests.exceptions.Timeout:
-        return "Сервис отвечает медленно, попробуйте позже."
-    except requests.exceptions.ConnectionError:
-        return "Проблема с соединением, попробуйте позже."
-    except Exception as e:
-        logging.error(f"DeepSeek API error: {e}")
-        return "Сервис временно недоступен, попробуйте позже."
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_message = update.message.text
-    chat_id = update.effective_chat.id
-    save_user(chat_id)
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
-    # Проверка интернет-соединения
-    if not check_internet_connection():
-        await context.bot.send_message(chat_id=chat_id, text="Проблема с интернет-соединением. Попробуйте позже.")
-        return
-    
-    # Обработка кнопок
-    if user_message == "Статистика" and user_id == ADMIN_ID:
-        await stats(update, context)
-        return
-    if user_message == "Рассылка" and user_id == ADMIN_ID:
-        await context.bot.send_message(chat_id=chat_id, text="Введите команду /broadcast текст_сообщения для рассылки.")
-        return
-    if user_message == "Помощь":
-        await context.bot.send_message(chat_id=chat_id, text="Я могу отвечать на ваши вопросы с помощью DeepSeek. Просто напишите сообщение!")
-        return
-    
-    # Отправляем "печатает" индикатор
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    
-    response = ask_deepseek(user_message, str(chat_id))
-    await context.bot.send_message(chat_id=chat_id, text=response)
+    if user_id in user_sessions:
+        user_sessions[user_id]["history"] = []
+    await update.message.reply_text("🧹 История диалога очищена.")
 
-if __name__ == '__main__':
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('stats', stats))
-    application.add_handler(CommandHandler('broadcast', broadcast))
-    application.add_handler(CommandHandler('activity', activity))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    application.run_polling() 
+async def set_system_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    session = get_session(user_id)
+    new_prompt = " ".join(context.args)
+    if not new_prompt:
+        current = session["system_prompt"]
+        await update.message.reply_text(f"Текущий системный промпт:\n{current}")
+        return
+    session["system_prompt"] = new_prompt
+    session["history"] = []
+    await update.message.reply_text(f"✅ Системный промпт изменён на:\n{new_prompt}")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Доступные команды:*\n"
+        "/start – начать диалог\n"
+        "/reset – очистить память\n"
+        "/system <текст> – задать новую роль / характер\n"
+        "/image <описание> – сгенерировать картинку (через DeepSeek Image API)\n"
+        "/help – эта справка\n\n"
+        "Просто напишите сообщение – я отвечу с учётом предыдущих сообщений.",
+        parse_mode="Markdown",
+    )
+
+# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ==========
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Генерирует изображение по запросу /image <описание>"""
+    user_id = update.effective_user.id
+    prompt = " ".join(context.args)
+
+    if not prompt:
+        await update.message.reply_text(
+            "❓ Пожалуйста, укажите описание после команды.\n"
+            "Пример: `/image красный кот в космосе`",
+            parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text(f"🎨 Генерирую изображение: \"{prompt}\"...")
+    await update.message.chat.send_action(action="upload_photo")
+
+    try:
+        # Используем deepseek_client для генерации изображения
+        # (Если DeepSeek не поддерживает, замените на openai_client)
+        response = await deepseek_client.images.generate(
+            model="dall-e-3",          # или "deepseek-image", если появится
+            prompt=prompt,
+            size="1024x1024",
+            quality="standard",
+            n=1,
+        )
+        image_url = response.data[0].url
+
+        # Скачиваем и отправляем
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as resp:
+                if resp.status == 200:
+                    image_data = await resp.read()
+                    await update.message.reply_photo(
+                        photo=image_data,
+                        caption=f"✨ Вот что получилось по запросу: \"{prompt}\""
+                    )
+                else:
+                    await update.message.reply_text("❌ Не удалось загрузить изображение.")
+    except Exception as e:
+        logger.exception("Ошибка при генерации изображения")
+        await update.message.reply_text(f"❌ Ошибка при генерации: {str(e)}")
+
+# ========== ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ==========
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_message = update.message.text
+
+    await update.message.chat.send_action(action="typing")
+
+    session = get_session(user_id)
+    history = session["history"]
+    system_prompt = session["system_prompt"]
+
+    history.append({"role": "user", "content": user_message})
+    history = trim_history(history)
+    session["history"] = history
+
+    messages_for_api = [
+        {"role": "system", "content": system_prompt},
+        *history,
+    ]
+
+    try:
+        reply = await ask_deepseek_with_retry(messages_for_api)
+        session["history"].append({"role": "assistant", "content": reply})
+
+        parts = split_long_message(reply)
+        for i, part in enumerate(parts):
+            await update.message.reply_text(part)
+            if i < len(parts) - 1:
+                await asyncio.sleep(0.3)
+    except Exception as e:
+        logger.exception("Ошибка при обработке сообщения")
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+
+# ========== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ==========
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+    if update and update.effective_message:
+        await update.effective_message.reply_text(
+            "⚠️ Произошла внутренняя ошибка. Администратор уже уведомлён."
+        )
+
+# ========== ЗАПУСК ==========
+def main():
+    if not TELEGRAM_TOKEN:
+        raise ValueError("Переменная TELEGRAM_BOT_TOKEN не задана")
+    if not DEEPSEEK_API_KEY:
+        raise ValueError("Переменная DEEPSEEK_API_KEY не задана")
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("system", set_system_prompt))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("image", image_command))   # <-- новая команда
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
+
+    logger.info("Бот запущен и готов к работе")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
