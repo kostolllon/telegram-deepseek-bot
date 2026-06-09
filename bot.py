@@ -1,7 +1,9 @@
 import os
 import asyncio
 import logging
+import traceback
 from typing import Dict, List
+import urllib.parse
 
 import aiohttp
 from dotenv import load_dotenv
@@ -15,32 +17,28 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ========== НАСТРОЙКИ ==========
+# ========== НАСТРОЙКИ ЛОГИРОВАНИЯ ==========
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO  # можно временно поставить DEBUG
+)
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
-# Логирование
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Клиент DeepSeek (для текста)
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url=DEEPSEEK_BASE_URL,
 )
 
-# ========== ХРАНИЛИЩЕ ПОЛЬЗОВАТЕЛЕЙ ==========
 user_sessions: Dict[int, Dict] = {}
-
-MAX_HISTORY_LENGTH = 20  # Увеличено для лучшего контекста
+MAX_HISTORY_LENGTH = 20
 DEFAULT_SYSTEM_PROMPT = "Ты полезный, добрый и краткий помощник. Отвечай на русском языке."
 
 def get_session(user_id: int) -> Dict:
-    """Возвращает сессию пользователя (создаёт, если нет)"""
     if user_id not in user_sessions:
         user_sessions[user_id] = {
             "history": [],
@@ -49,13 +47,11 @@ def get_session(user_id: int) -> Dict:
     return user_sessions[user_id]
 
 def trim_history(history: List[Dict]) -> List[Dict]:
-    """Ограничивает историю последними MAX_HISTORY_LENGTH сообщениями"""
     if len(history) > MAX_HISTORY_LENGTH:
         return history[-MAX_HISTORY_LENGTH:]
     return history
 
 def split_long_message(text: str, max_len: int = 4096) -> List[str]:
-    """Разбивает длинный текст на части, не разрывая слова"""
     if len(text) <= max_len:
         return [text]
     parts = []
@@ -70,17 +66,14 @@ def split_long_message(text: str, max_len: int = 4096) -> List[str]:
     parts.append(text)
     return parts
 
-async def ask_deepseek_with_retry(
-    messages: List[Dict], retries: int = 2, delay: float = 1.0
-) -> str:
-    """Запрос к DeepSeek с повторными попытками (без ограничения max_tokens)"""
+async def ask_deepseek_with_retry(messages: List[Dict], retries: int = 2, delay: float = 1.0) -> str:
     for attempt in range(retries + 1):
         try:
             response = await deepseek_client.chat.completions.create(
                 model="deepseek-chat",
                 messages=messages,
                 temperature=0.7,
-                max_tokens=None,  # <-- Убираем лимит
+                max_tokens=None,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -88,98 +81,86 @@ async def ask_deepseek_with_retry(
             if attempt < retries:
                 await asyncio.sleep(delay * (attempt + 1))
             else:
-                raise Exception("Сервис DeepSeek временно недоступен. Попробуйте позже.")
+                raise
 
 # ========== КОМАНДЫ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"User {update.effective_user.id} issued /start")
     user_id = update.effective_user.id
     get_session(user_id)
     await update.message.reply_text(
-        "🤖 Привет! Я бот на основе DeepSeek. Я помню контекст разговора.\n\n"
+        "🤖 Привет! Я бот на основе DeepSeek.\n\n"
         "Команды:\n"
-        "/reset – сбросить историю диалога\n"
-        "/system <новый промпт> – изменить мою личность\n"
+        "/reset – сбросить историю\n"
+        "/system <промпт> – сменить личность\n"
         "/image <описание> – сгенерировать картинку (бесплатно)\n"
-        "/help – справка\n\n"
-        "У меня нет лимита на длину ответа – пишу столько, сколько нужно!"
+        "/help – справка"
     )
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"User {update.effective_user.id} issued /reset")
     user_id = update.effective_user.id
     if user_id in user_sessions:
         user_sessions[user_id]["history"] = []
-    await update.message.reply_text("🧹 История диалога очищена.")
+    await update.message.reply_text("🧹 История очищена.")
 
 async def set_system_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info(f"User {user_id} issued /system with args: {context.args}")
     session = get_session(user_id)
     new_prompt = " ".join(context.args)
     if not new_prompt:
-        current = session["system_prompt"]
-        await update.message.reply_text(f"Текущий системный промпт:\n{current}")
+        await update.message.reply_text(f"Текущий промпт:\n{session['system_prompt']}")
         return
     session["system_prompt"] = new_prompt
     session["history"] = []
-    await update.message.reply_text(f"✅ Системный промпт изменён на:\n{new_prompt}")
+    await update.message.reply_text(f"✅ Промпт изменён:\n{new_prompt}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"User {update.effective_user.id} issued /help")
     await update.message.reply_text(
-        "📖 *Доступные команды:*\n"
-        "/start – начать диалог\n"
-        "/reset – очистить память\n"
-        "/system <текст> – задать новую роль / характер\n"
-        "/image <описание> – сгенерировать картинку (бесплатно, через Pollinations.ai)\n"
-        "/help – эта справка\n\n"
-        "Просто напишите сообщение – я отвечу с учётом предыдущих сообщений. "
-        "Мои ответы не ограничены по длине (кроме лимита Telegram на одно сообщение в 4096 символов, но я автоматически разбиваю длинные сообщения).",
-        parse_mode="Markdown",
+        "/start - приветствие\n/reset - сброс истории\n/system <текст> - задать роль\n/image <описание> - сгенерировать картинку"
     )
 
-# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (БЕСПЛАТНО, БЕЗ КЛЮЧА) ==========
+# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ==========
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Генерирует изображение через Pollinations.ai (бесплатно)"""
+    user_id = update.effective_user.id
+    logger.info(f"User {user_id} issued /image with args: {context.args}")
     prompt = " ".join(context.args)
-
     if not prompt:
-        await update.message.reply_text(
-            "❓ Пожалуйста, укажите описание после команды.\n"
-            "Пример: `/image красный кот в космосе`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("❓ Напиши описание после /image, например: `/image кот в космосе`", parse_mode="Markdown")
         return
 
-    await update.message.reply_text(f"🎨 Генерирую изображение: \"{prompt}\"...")
-    await update.message.chat.send_action(action="upload_photo")
+    await update.message.reply_text(f"🎨 Генерирую: \"{prompt}\"...")
 
-    # URL бесплатного API Pollinations.ai
-    # Параметры: размер 1024x1024, модель flux (быстрая и качественная)
     # Кодируем prompt для URL
-    import urllib.parse
     encoded_prompt = urllib.parse.quote(prompt)
-    api_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&model=flux"
+    api_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+    logger.info(f"Requesting URL: {api_url}")
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(api_url) as resp:
+            async with session.get(api_url, timeout=30) as resp:
+                logger.info(f"Response status: {resp.status}")
                 if resp.status == 200:
                     image_data = await resp.read()
-                    await update.message.reply_photo(
-                        photo=image_data,
-                        caption=f"✨ Вот что получилось по запросу: \"{prompt}\""
-                    )
+                    logger.info(f"Image size: {len(image_data)} bytes")
+                    await update.message.reply_photo(photo=image_data, caption=f"✨ \"{prompt}\"")
                 else:
-                    await update.message.reply_text(f"❌ Ошибка генерации: сервер вернул статус {resp.status}")
+                    error_text = await resp.text()
+                    logger.error(f"Pollinations error {resp.status}: {error_text[:200]}")
+                    await update.message.reply_text(f"❌ Ошибка {resp.status}: {error_text[:200]}")
     except Exception as e:
-        logger.exception("Ошибка при генерации изображения")
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        logger.error(f"Exception in image_command: {traceback.format_exc()}")
+        await update.message.reply_text(f"❌ Исключение: {str(e)}")
 
-# ========== ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ==========
+# ========== ТЕКСТОВЫЕ СООБЩЕНИЯ ==========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text
+    logger.info(f"Received message from {user_id}: {user_message[:50]}...")
 
     await update.message.chat.send_action(action="typing")
-
     session = get_session(user_id)
     history = session["history"]
     system_prompt = session["system_prompt"]
@@ -188,13 +169,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = trim_history(history)
     session["history"] = history
 
-    messages_for_api = [
-        {"role": "system", "content": system_prompt},
-        *history,
-    ]
+    messages_for_api = [{"role": "system", "content": system_prompt}, *history]
 
     try:
         reply = await ask_deepseek_with_retry(messages_for_api)
+        logger.info(f"Got reply from DeepSeek, length: {len(reply)} chars")
         session["history"].append({"role": "assistant", "content": reply})
 
         parts = split_long_message(reply)
@@ -203,36 +182,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if i < len(parts) - 1:
                 await asyncio.sleep(0.3)
     except Exception as e:
-        logger.exception("Ошибка при обработке сообщения")
+        logger.error(f"Error in handle_message: {traceback.format_exc()}")
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
-# ========== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ==========
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
     if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "⚠️ Произошла внутренняя ошибка. Администратор уже уведомлён."
-        )
+        await update.effective_message.reply_text("⚠️ Внутренняя ошибка. Администратор уведомлён.")
 
-# ========== ЗАПУСК ==========
 def main():
     if not TELEGRAM_TOKEN:
-        raise ValueError("Переменная TELEGRAM_BOT_TOKEN не задана")
+        raise ValueError("TELEGRAM_BOT_TOKEN не задан")
     if not DEEPSEEK_API_KEY:
-        raise ValueError("Переменная DEEPSEEK_API_KEY не задана")
+        raise ValueError("DEEPSEEK_API_KEY не задан")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("system", set_system_prompt))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("image", image_command))  # <-- обновлённая команда
-
+    app.add_handler(CommandHandler("image", image_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("Бот запущен и готов к работе (текст + бесплатная генерация изображений)")
+    logger.info("Бот запущен и ожидает сообщения...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
