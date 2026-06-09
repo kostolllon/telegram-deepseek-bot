@@ -36,7 +36,7 @@ deepseek_client = AsyncOpenAI(
 # ========== ХРАНИЛИЩЕ ПОЛЬЗОВАТЕЛЕЙ ==========
 user_sessions: Dict[int, Dict] = {}
 
-MAX_HISTORY_LENGTH = 10
+MAX_HISTORY_LENGTH = 20  # Увеличено для лучшего контекста
 DEFAULT_SYSTEM_PROMPT = "Ты полезный, добрый и краткий помощник. Отвечай на русском языке."
 
 def get_session(user_id: int) -> Dict:
@@ -73,14 +73,14 @@ def split_long_message(text: str, max_len: int = 4096) -> List[str]:
 async def ask_deepseek_with_retry(
     messages: List[Dict], retries: int = 2, delay: float = 1.0
 ) -> str:
-    """Запрос к DeepSeek с повторными попытками"""
+    """Запрос к DeepSeek с повторными попытками (без ограничения max_tokens)"""
     for attempt in range(retries + 1):
         try:
             response = await deepseek_client.chat.completions.create(
                 model="deepseek-chat",
                 messages=messages,
                 temperature=0.7,
-                max_tokens=2000,
+                max_tokens=None,  # <-- Убираем лимит, нейросеть пишет столько, сколько нужно
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -100,7 +100,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/reset – сбросить историю диалога\n"
         "/system <новый промпт> – изменить мою личность\n"
         "/image <описание> – сгенерировать картинку\n"
-        "/help – справка"
+        "/help – справка\n\n"
+        "У меня нет лимита на длину ответа – пишу столько, сколько нужно!"
     )
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -129,14 +130,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/system <текст> – задать новую роль / характер\n"
         "/image <описание> – сгенерировать картинку (через DeepSeek Image API)\n"
         "/help – эта справка\n\n"
-        "Просто напишите сообщение – я отвечу с учётом предыдущих сообщений.",
+        "Просто напишите сообщение – я отвечу с учётом предыдущих сообщений. "
+        "Мои ответы не ограничены по длине (кроме лимита Telegram на одно сообщение в 4096 символов, но я автоматически разбиваю длинные сообщения).",
         parse_mode="Markdown",
     )
 
 # ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ==========
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Генерирует изображение по запросу /image <описание>"""
-    user_id = update.effective_user.id
     prompt = " ".join(context.args)
 
     if not prompt:
@@ -152,7 +153,7 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         # Используем deepseek_client для генерации изображения
-        # (Если DeepSeek не поддерживает, замените на openai_client)
+        # (Если DeepSeek не поддерживает, замените на openai_client с ключом OpenAI)
         response = await deepseek_client.images.generate(
             model="dall-e-3",          # или "deepseek-image", если появится
             prompt=prompt,
@@ -162,7 +163,6 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         image_url = response.data[0].url
 
-        # Скачиваем и отправляем
         async with aiohttp.ClientSession() as session:
             async with session.get(image_url) as resp:
                 if resp.status == 200:
@@ -231,12 +231,12 @@ def main():
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("system", set_system_prompt))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("image", image_command))   # <-- новая команда
+    app.add_handler(CommandHandler("image", image_command))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("Бот запущен и готов к работе")
+    logger.info("Бот запущен и готов к работе (без лимита на длину ответа)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
