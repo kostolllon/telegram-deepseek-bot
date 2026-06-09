@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Клиент DeepSeek с явным http_client (избегаем ошибки proxies)
+# Клиент DeepSeek с явным http_client (избегаем проблем с прокси)
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url=DEEPSEEK_BASE_URL,
@@ -192,14 +192,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    # Удаляем вебхук перед стартом (избегаем конфликта)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(app.bot.delete_webhook(drop_pending_updates=True))
-    loop.close()
-
-    logger.info("Бот запущен и ожидает сообщения...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Запускаем polling с автоматическим удалением вебхука
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
