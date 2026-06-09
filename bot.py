@@ -2,8 +2,8 @@ import os
 import asyncio
 import logging
 import traceback
-from typing import Dict, List
 import urllib.parse
+from typing import Dict, List
 
 import aiohttp
 from dotenv import load_dotenv
@@ -17,23 +17,24 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ========== НАСТРОЙКИ ЛОГИРОВАНИЯ ==========
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO  # можно временно поставить DEBUG
-)
-logger = logging.getLogger(__name__)
-
+# ========== НАСТРОЙКИ ==========
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url=DEEPSEEK_BASE_URL,
 )
 
+# ========== ХРАНИЛИЩЕ ПОЛЬЗОВАТЕЛЕЙ ==========
 user_sessions: Dict[int, Dict] = {}
 MAX_HISTORY_LENGTH = 20
 DEFAULT_SYSTEM_PROMPT = "Ты полезный, добрый и краткий помощник. Отвечай на русском языке."
@@ -122,7 +123,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - приветствие\n/reset - сброс истории\n/system <текст> - задать роль\n/image <описание> - сгенерировать картинку"
     )
 
-# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ==========
+# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (Pollinations.ai) ==========
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"User {user_id} issued /image with args: {context.args}")
@@ -132,8 +133,6 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(f"🎨 Генерирую: \"{prompt}\"...")
-
-    # Кодируем prompt для URL
     encoded_prompt = urllib.parse.quote(prompt)
     api_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
     logger.info(f"Requesting URL: {api_url}")
@@ -154,7 +153,7 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Exception in image_command: {traceback.format_exc()}")
         await update.message.reply_text(f"❌ Исключение: {str(e)}")
 
-# ========== ТЕКСТОВЫЕ СООБЩЕНИЯ ==========
+# ========== ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ==========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text
@@ -185,18 +184,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in handle_message: {traceback.format_exc()}")
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
+# ========== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ==========
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
     if update and update.effective_message:
         await update.effective_message.reply_text("⚠️ Внутренняя ошибка. Администратор уведомлён.")
 
-def main():
+# ========== ЗАПУСК С УДАЛЕНИЕМ ВЕБХУКА ==========
+async def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN не задан")
     if not DEEPSEEK_API_KEY:
         raise ValueError("DEEPSEEK_API_KEY не задан")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("system", set_system_prompt))
@@ -205,8 +208,21 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
+    # Удаляем вебхук, чтобы избежать конфликта (важно!)
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Webhook deleted, starting polling...")
+
+    # Запускаем polling
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
     logger.info("Бот запущен и ожидает сообщения...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Бесконечное ожидание (чтобы бот не завершился)
+    try:
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        await app.stop()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
