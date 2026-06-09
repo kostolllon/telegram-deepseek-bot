@@ -92,7 +92,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     get_session(user_id)
     await update.message.reply_text(
-        "🤖 Привет! Я бот на основе DeepSeek.\n\n"
+        "🤖 Привет! Я бот, работающий на основе DeepSeek и OpenAI.\n\n"
         "Команды:\n"
         "/reset – сбросить историю\n"
         "/system <промпт> – сменить личность\n"
