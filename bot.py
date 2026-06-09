@@ -6,6 +6,7 @@ import urllib.parse
 from typing import Dict, List
 
 import aiohttp
+import httpx
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from telegram import Update
@@ -29,9 +30,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Клиент DeepSeek с явным http_client (избегаем ошибки proxies)
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url=DEEPSEEK_BASE_URL,
+    http_client=httpx.AsyncClient(),
 )
 
 # ========== ХРАНИЛИЩЕ ПОЛЬЗОВАТЕЛЕЙ ==========
@@ -86,7 +89,6 @@ async def ask_deepseek_with_retry(messages: List[Dict], retries: int = 2, delay:
 
 # ========== КОМАНДЫ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"User {update.effective_user.id} issued /start")
     user_id = update.effective_user.id
     get_session(user_id)
     await update.message.reply_text(
@@ -99,7 +101,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"User {update.effective_user.id} issued /reset")
     user_id = update.effective_user.id
     if user_id in user_sessions:
         user_sessions[user_id]["history"] = []
@@ -107,7 +108,6 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_system_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"User {user_id} issued /system with args: {context.args}")
     session = get_session(user_id)
     new_prompt = " ".join(context.args)
     if not new_prompt:
@@ -118,47 +118,36 @@ async def set_system_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Промпт изменён:\n{new_prompt}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"User {update.effective_user.id} issued /help")
     await update.message.reply_text(
         "/start - приветствие\n/reset - сброс истории\n/system <текст> - задать роль\n/image <описание> - сгенерировать картинку"
     )
 
-# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (Pollinations.ai) ==========
+# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (POLLINATIONS.AI) ==========
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    logger.info(f"User {user_id} issued /image with args: {context.args}")
     prompt = " ".join(context.args)
     if not prompt:
         await update.message.reply_text("❓ Напиши описание после /image, например: `/image кот в космосе`", parse_mode="Markdown")
         return
-
     await update.message.reply_text(f"🎨 Генерирую: \"{prompt}\"...")
     encoded_prompt = urllib.parse.quote(prompt)
     api_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-    logger.info(f"Requesting URL: {api_url}")
-
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(api_url, timeout=30) as resp:
-                logger.info(f"Response status: {resp.status}")
                 if resp.status == 200:
                     image_data = await resp.read()
-                    logger.info(f"Image size: {len(image_data)} bytes")
                     await update.message.reply_photo(photo=image_data, caption=f"✨ \"{prompt}\"")
                 else:
                     error_text = await resp.text()
-                    logger.error(f"Pollinations error {resp.status}: {error_text[:200]}")
                     await update.message.reply_text(f"❌ Ошибка {resp.status}: {error_text[:200]}")
     except Exception as e:
-        logger.error(f"Exception in image_command: {traceback.format_exc()}")
+        logger.exception("Ошибка в image_command")
         await update.message.reply_text(f"❌ Исключение: {str(e)}")
 
-# ========== ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ==========
+# ========== ОБРАБОТКА ТЕКСТА ==========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text
-    logger.info(f"Received message from {user_id}: {user_message[:50]}...")
-
     await update.message.chat.send_action(action="typing")
     session = get_session(user_id)
     history = session["history"]
@@ -172,34 +161,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         reply = await ask_deepseek_with_retry(messages_for_api)
-        logger.info(f"Got reply from DeepSeek, length: {len(reply)} chars")
         session["history"].append({"role": "assistant", "content": reply})
-
         parts = split_long_message(reply)
         for i, part in enumerate(parts):
             await update.message.reply_text(part)
             if i < len(parts) - 1:
                 await asyncio.sleep(0.3)
     except Exception as e:
-        logger.error(f"Error in handle_message: {traceback.format_exc()}")
+        logger.exception("Ошибка в handle_message")
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
-# ========== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ==========
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
     if update and update.effective_message:
         await update.effective_message.reply_text("⚠️ Внутренняя ошибка. Администратор уведомлён.")
 
-# ========== ЗАПУСК С УДАЛЕНИЕМ ВЕБХУКА ==========
-async def main():
+# ========== ЗАПУСК ==========
+def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN не задан")
     if not DEEPSEEK_API_KEY:
         raise ValueError("DEEPSEEK_API_KEY не задан")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("system", set_system_prompt))
@@ -208,21 +192,14 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    # Удаляем вебхук, чтобы избежать конфликта (важно!)
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Webhook deleted, starting polling...")
+    # Удаляем вебхук перед стартом (избегаем конфликта)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(app.bot.delete_webhook(drop_pending_updates=True))
+    loop.close()
 
-    # Запускаем polling
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
     logger.info("Бот запущен и ожидает сообщения...")
-
-    # Бесконечное ожидание (чтобы бот не завершился)
-    try:
-        await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        await app.stop()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
