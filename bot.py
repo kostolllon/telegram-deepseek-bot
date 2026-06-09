@@ -27,7 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Клиент DeepSeek (совместим с OpenAI API)
+# Клиент DeepSeek (для текста)
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url=DEEPSEEK_BASE_URL,
@@ -80,7 +80,7 @@ async def ask_deepseek_with_retry(
                 model="deepseek-chat",
                 messages=messages,
                 temperature=0.7,
-                max_tokens=None,  # <-- Убираем лимит, нейросеть пишет столько, сколько нужно
+                max_tokens=None,  # <-- Убираем лимит
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -99,7 +99,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/reset – сбросить историю диалога\n"
         "/system <новый промпт> – изменить мою личность\n"
-        "/image <описание> – сгенерировать картинку\n"
+        "/image <описание> – сгенерировать картинку (бесплатно)\n"
         "/help – справка\n\n"
         "У меня нет лимита на длину ответа – пишу столько, сколько нужно!"
     )
@@ -128,16 +128,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start – начать диалог\n"
         "/reset – очистить память\n"
         "/system <текст> – задать новую роль / характер\n"
-        "/image <описание> – сгенерировать картинку (через DeepSeek Image API)\n"
+        "/image <описание> – сгенерировать картинку (бесплатно, через Pollinations.ai)\n"
         "/help – эта справка\n\n"
         "Просто напишите сообщение – я отвечу с учётом предыдущих сообщений. "
         "Мои ответы не ограничены по длине (кроме лимита Telegram на одно сообщение в 4096 символов, но я автоматически разбиваю длинные сообщения).",
         parse_mode="Markdown",
     )
 
-# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ==========
+# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (БЕСПЛАТНО, БЕЗ КЛЮЧА) ==========
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Генерирует изображение по запросу /image <описание>"""
+    """Генерирует изображение через Pollinations.ai (бесплатно)"""
     prompt = " ".join(context.args)
 
     if not prompt:
@@ -151,20 +151,16 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🎨 Генерирую изображение: \"{prompt}\"...")
     await update.message.chat.send_action(action="upload_photo")
 
-    try:
-        # Используем deepseek_client для генерации изображения
-        # (Если DeepSeek не поддерживает, замените на openai_client с ключом OpenAI)
-        response = await deepseek_client.images.generate(
-            model="dall-e-3",          # или "deepseek-image", если появится
-            prompt=prompt,
-            size="1024x1024",
-            quality="standard",
-            n=1,
-        )
-        image_url = response.data[0].url
+    # URL бесплатного API Pollinations.ai
+    # Параметры: размер 1024x1024, модель flux (быстрая и качественная)
+    # Кодируем prompt для URL
+    import urllib.parse
+    encoded_prompt = urllib.parse.quote(prompt)
+    api_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&model=flux"
 
+    try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(image_url) as resp:
+            async with session.get(api_url) as resp:
                 if resp.status == 200:
                     image_data = await resp.read()
                     await update.message.reply_photo(
@@ -172,10 +168,10 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         caption=f"✨ Вот что получилось по запросу: \"{prompt}\""
                     )
                 else:
-                    await update.message.reply_text("❌ Не удалось загрузить изображение.")
+                    await update.message.reply_text(f"❌ Ошибка генерации: сервер вернул статус {resp.status}")
     except Exception as e:
         logger.exception("Ошибка при генерации изображения")
-        await update.message.reply_text(f"❌ Ошибка при генерации: {str(e)}")
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
 # ========== ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ==========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -231,12 +227,12 @@ def main():
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("system", set_system_prompt))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("image", image_command))
+    app.add_handler(CommandHandler("image", image_command))  # <-- обновлённая команда
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("Бот запущен и готов к работе (без лимита на длину ответа)")
+    logger.info("Бот запущен и готов к работе (текст + бесплатная генерация изображений)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
