@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-import traceback
 import urllib.parse
 from typing import Dict, List
 
@@ -23,6 +22,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+BFL_API_KEY = os.getenv("BFL_API_KEY")  # API-ключ Black Forest Labs (FLUX)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Клиент DeepSeek с явным http_client (избегаем проблем с прокси)
+# Клиент DeepSeek
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url=DEEPSEEK_BASE_URL,
@@ -40,7 +40,7 @@ deepseek_client = AsyncOpenAI(
 # ========== ХРАНИЛИЩЕ ПОЛЬЗОВАТЕЛЕЙ ==========
 user_sessions: Dict[int, Dict] = {}
 MAX_HISTORY_LENGTH = 20
-DEFAULT_SYSTEM_PROMPT = "Ты полезный, добрый, слегка загадочный и краткий помощник. Отвечай на русском языке."
+DEFAULT_SYSTEM_PROMPT = "Ты полезный, добрый и краткий помощник. Отвечай на русском языке."
 
 def get_session(user_id: int) -> Dict:
     if user_id not in user_sessions:
@@ -92,11 +92,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     get_session(user_id)
     await update.message.reply_text(
-        "🤖 Привет! Я бот MimAI, работающий на основе DeepSeek и OpenAI.\n\n"
+        "🤖 Привет! Я бот на основе DeepSeek.\n\n"
         "Команды:\n"
         "/reset – сбросить историю\n"
         "/system <промпт> – сменить личность\n"
-        "/image <описание> – сгенерировать картинку (бесплатно)\n"
+        "/image <описание> – сгенерировать картинку (FLUX)\n"
         "/help – справка"
     )
 
@@ -119,36 +119,95 @@ async def set_system_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "/start - приветствие\n/reset - сброс истории\n/system <текст> - задать роль\n/image <описание> - сгенерировать картинку"
+        "/start - приветствие\n/reset - сброс истории\n/system <текст> - задать роль\n/image <описание> - сгенерировать картинку (FLUX)"
     )
 
-# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (POLLINATIONS.AI) ==========
+# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (FLUX через Black Forest Labs) ==========
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = " ".join(context.args)
     if not prompt:
-        await update.message.reply_text("❓ Напиши описание после /image, например: `/image кот в космосе`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❓ Напиши описание после /image, например: `/image cat in space`",
+            parse_mode="Markdown"
+        )
         return
-    await update.message.reply_text(f"🎨 Генерирую: \"{prompt}\"...")
-    encoded_prompt = urllib.parse.quote(prompt)
-    api_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+
+    processing_msg = await update.message.reply_text(f"🎨 Генерирую изображение: \"{prompt}\"...")
+
+    if not BFL_API_KEY:
+        await processing_msg.edit_text("❌ API-ключ BFL не настроен. Добавьте переменную BFL_API_KEY в Railway.")
+        return
+
+    # Эндпоинт для модели FLUX.2 klein (бюджетная, но качественная)
+    # Цена: $0.014 за изображение
+    url = "https://api.bfl.ai/v1/flux-2-klein-4b"
+    headers = {
+        "X-Key": BFL_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "prompt": prompt,
+        "width": 1024,
+        "height": 768,
+        "steps": 25,
+    }
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(api_url, timeout=30) as resp:
-                if resp.status == 200:
-                    image_data = await resp.read()
-                    await update.message.reply_photo(photo=image_data, caption=f"✨ \"{prompt}\"")
-                else:
+            # 1. Отправляем запрос на генерацию
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status != 200:
                     error_text = await resp.text()
-                    await update.message.reply_text(f"❌ Ошибка {resp.status}: {error_text[:200]}")
+                    await processing_msg.edit_text(f"❌ Ошибка API FLUX: {resp.status}\n{error_text[:200]}")
+                    return
+                result = await resp.json()
+                request_id = result.get("id")
+                if not request_id:
+                    await processing_msg.edit_text("❌ Не удалось получить ID задания.")
+                    return
+
+            # 2. Ожидаем результат (polling)
+            status_url = f"https://api.bfl.ai/v1/get_result?id={request_id}"
+            max_attempts = 40  # ~40 секунд
+            for attempt in range(max_attempts):
+                await processing_msg.edit_text(f"🎨 Генерация... (попытка {attempt+1}/{max_attempts})")
+                async with session.get(status_url, headers=headers) as status_resp:
+                    if status_resp.status == 200:
+                        data = await status_resp.json()
+                        status = data.get("status")
+                        if status == "Ready":
+                            image_url = data["result"]["sample"]
+                            await processing_msg.delete()
+                            await update.message.reply_photo(photo=image_url, caption=f"✨ \"{prompt}\"")
+                            return
+                        elif status == "Error":
+                            error_msg = data.get("error", "Неизвестная ошибка")
+                            await processing_msg.edit_text(f"❌ Ошибка FLUX: {error_msg}")
+                            return
+                    elif status_resp.status == 404:
+                        # Ещё не готово, ждём
+                        await asyncio.sleep(1)
+                        continue
+                    else:
+                        error_text = await status_resp.text()
+                        await processing_msg.edit_text(f"❌ Ошибка при проверке статуса: {status_resp.status}\n{error_text[:200]}")
+                        return
+                await asyncio.sleep(1)
+
+            # Если не дождались
+            await processing_msg.edit_text("❌ Генерация заняла слишком много времени. Попробуйте ещё раз.")
+
     except Exception as e:
         logger.exception("Ошибка в image_command")
-        await update.message.reply_text(f"❌ Исключение: {str(e)}")
+        await processing_msg.edit_text(f"❌ Исключение: {str(e)}")
 
-# ========== ОБРАБОТКА ТЕКСТА ==========
+# ========== ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ==========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text
+
     await update.message.chat.send_action(action="typing")
+
     session = get_session(user_id)
     history = session["history"]
     system_prompt = session["system_prompt"]
@@ -162,6 +221,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         reply = await ask_deepseek_with_retry(messages_for_api)
         session["history"].append({"role": "assistant", "content": reply})
+
         parts = split_long_message(reply)
         for i, part in enumerate(parts):
             await update.message.reply_text(part)
@@ -182,6 +242,8 @@ def main():
         raise ValueError("TELEGRAM_BOT_TOKEN не задан")
     if not DEEPSEEK_API_KEY:
         raise ValueError("DEEPSEEK_API_KEY не задан")
+    if not BFL_API_KEY:
+        logger.warning("BFL_API_KEY не задан. Команда /image не будет работать.")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -192,7 +254,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    # Запускаем polling с автоматическим удалением вебхука
+    logger.info("Бот запущен и ожидает сообщения...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
