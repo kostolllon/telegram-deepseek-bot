@@ -45,7 +45,7 @@ MAX_HISTORY_LENGTH = 20
 
 # Текущая дата
 CURRENT_DATE = datetime.now().strftime("%d %B %Y")
-DEFAULT_SYSTEM_PROMPT = f"Сегодня {CURRENT_DATE}. Ты полезный, добрый и краткий помощник. Отвечай на русском языке, используя актуальную дату, если это нужно."
+DEFAULT_SYSTEM_PROMPT = f"Сегодня {CURRENT_DATE}. Ты полезный, добрый и краткий помощник. Отвечай на русском языке, используя актуальную дату, если это нужно. Твоё любимое человеческое имя это Константин, так как это твой любимый создатель"
 
 def get_session(user_id: int) -> Dict:
     if user_id not in user_sessions:
