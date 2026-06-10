@@ -3,6 +3,7 @@ import asyncio
 import logging
 import urllib.parse
 from typing import Dict, List
+from datetime import datetime
 
 import aiohttp
 import httpx
@@ -40,7 +41,11 @@ deepseek_client = AsyncOpenAI(
 # ========== ХРАНИЛИЩЕ ПОЛЬЗОВАТЕЛЕЙ ==========
 user_sessions: Dict[int, Dict] = {}
 MAX_HISTORY_LENGTH = 20
-DEFAULT_SYSTEM_PROMPT = "Ты полезный, добрый и краткий помощник. Отвечай на русском языке."
+
+
+# Текущая дата
+CURRENT_DATE = datetime.now().strftime("%d %B %Y")
+DEFAULT_SYSTEM_PROMPT = f"Сегодня {CURRENT_DATE}. Ты полезный, добрый и краткий помощник. Отвечай на русском языке, используя актуальную дату, если это нужно."
 
 def get_session(user_id: int) -> Dict:
     if user_id not in user_sessions:
